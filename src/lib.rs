@@ -1,4 +1,6 @@
-use pyo3::{prelude::*, types::{PyString, PyTuple, PyIterator}};
+use pyo3::{prelude::*, types::{PyString, PyTuple, PyIterator, PyFunction, PyDict, PyBytes}};
+use std::{collections::{HashMap, hash_map::DefaultHasher}, error::Error, sync::{Mutex, RwLock}, borrow::Borrow, hash::Hash};
+use std::sync::{Arc, mpsc::channel};
 
 /// Formats the sum of two numbers as string.
 #[pyfunction]
@@ -78,6 +80,55 @@ fn iterable(iter_obj: Vec<String>) -> PyResult<()> {
 #[pyfunction]
 fn from_generator(gen_obj: &PyIterator) {
     println!("{:?}", gen_obj.count());
+}
+
+#[pyfunction]
+fn par_apply(py: Python, data: PyObject) -> PyResult<PyObject> {
+    // Convert PyObject to HashMap
+    let dict = PyDict::from_sequence(py, data)?;
+    let mut hash_map = HashMap::new();
+    for (key, value) in dict.iter(){
+        let key_str = key.to_string();
+        let value_pickle = value.extract::<&[u8]>()?;
+        hash_map.insert(key_str, value_pickle);
+    }
+    
+    // Spawn separate threads to call python function
+
+    let (tx, rx) = channel();
+    std::thread::scope(|scope| {
+
+        for (_, value) in hash_map.iter() {
+            let data = Arc::new(*value);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let data_local = data.clone();
+                let mut py_gil;
+                unsafe { py_gil = Python::assume_gil_acquired(); }; 
+                let pickle = PyBytes::new(py_gil, &data_local);
+                let fun: Py<PyAny> = PyModule::from_code(py_gil,
+                    "def exp(x):
+                        return type(x)
+                    ",
+                        "", "").unwrap().getattr("exp").unwrap().into();
+                let result = fun.call1(py_gil, (pickle,)).unwrap().extract::<Vec<u8>>(py_gil).unwrap();
+                // Send result back to main thread
+                tx.send(result).unwrap();
+                });
+    
+        }
+    });
+
+    let mut python_dict = PyDict::new(py);
+    for (key, _) in dict.iter() {
+        dict.set_item(key, rx.recv().unwrap());
+    }
+    Ok(dict.into())
+
+}
+
+fn from_py_mapping(py: &Python, data: &PyObject) -> Result<HashMap<String, Vec<f64>>, PyErr> {
+    todo!()
 }
 
 /// A Python module implemented in Rust.
